@@ -1,0 +1,300 @@
+name: PR Automated Review
+
+"on":
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VOLCENGINE_ACCESS_KEY: ${{ secrets.VOLCENGINE_ACCESS_KEY }}
+      VOLCENGINE_SECRET_KEY: ${{ secrets.VOLCENGINE_SECRET_KEY }}
+      VOLCENGINE_REGION: "cn-beijing"
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install AgentKit SDK
+        run: python -m pip install "agentkit-sdk-python>=0.8.1,<0.9.0" "websockets>=12,<16"
+      - name: Start review in Sandbox Session
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "GH_TOKEN secret is required for PR review." >&2
+            exit 1
+          fi
+
+          SESSION_ID="pr-review-${{ github.run_id }}-${{ github.run_attempt }}"
+          export SESSION_ID
+          export PR_REVIEW_PROMPT="请评审这个 Pull Request：${{ github.event.pull_request.html_url }}\n\n要求：\n1.你需要遵守GitHub Skill，通过GitHubCLI获取PR信息、diff和必要的上下文\n2.遵守Code-Review Skill的规范，对PR进行CodeReview\n3.不要修改仓库文件，不要执行破坏性命令。\n4.执行结束后，请告知我你都进行了哪些操作，给出明确且清晰的反馈"
+          python <<'PY'
+          import asyncio
+          import json
+          import os
+          from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+          from agentkit.sdk.tools import types as tools_types
+          from agentkit.sdk.tools.client import AgentkitToolsClient
+          from pydantic import Field
+          import websockets
+
+          def _required_secret(name):
+              value = os.environ.get(name, "").strip()
+              if not value:
+                  raise RuntimeError(f"{name} secret is required.")
+              if any(character.isspace() for character in value):
+                  raise RuntimeError(f"{name} secret must not contain spaces or newlines.")
+              return value
+
+          def _model_supports_alias(model_type, alias):
+              fields = getattr(model_type, "model_fields", None) or getattr(model_type, "__fields__", {})
+              return any(getattr(field, "alias", None) == alias for field in fields.values())
+
+          class _SessionEnv(tools_types.ToolsBaseModel):
+              key: str = Field(alias="Key")
+              value: str = Field(alias="Value")
+
+          class _CreateSessionRequestCompat(tools_types.ToolsBaseModel):
+              tool_id: str = Field(alias="ToolId")
+              ttl: int = Field(alias="Ttl")
+              ttl_unit: str = Field(alias="TtlUnit")
+              user_session_id: str = Field(alias="UserSessionId")
+              envs: list[_SessionEnv] = Field(alias="Envs")
+
+          access_key = _required_secret("VOLCENGINE_ACCESS_KEY")
+          secret_key = _required_secret("VOLCENGINE_SECRET_KEY")
+          region = os.environ["VOLCENGINE_REGION"].strip()
+          user_session_id = os.environ["SESSION_ID"].strip()
+          github_token = _required_secret("GH_TOKEN")
+          prompt = os.environ["PR_REVIEW_PROMPT"].strip()
+
+          def _sandbox_service_url(endpoint, pathname, websocket=False):
+              parsed = urlsplit(endpoint)
+              if parsed.scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+                  raise RuntimeError("CreateSession returned an invalid Endpoint.")
+              scheme = (
+                  ("wss" if parsed.scheme in {"https", "wss"} else "ws")
+                  if websocket
+                  else ("https" if parsed.scheme in {"https", "wss"} else "http")
+              )
+              base_path = parsed.path.rstrip("/")
+              if base_path.endswith("/v1/codex/app-server"):
+                  base_path = base_path.removesuffix("/v1/codex/app-server")
+              values = list(parse_qsl(parsed.query, keep_blank_values=True))
+              return urlunsplit((scheme, parsed.netloc, f"{base_path}{pathname}", urlencode(values), ""))
+
+          def _runtime_permission_params(cwd=""):
+              return {
+                  "approvalPolicy": "on-request",
+                  "approvalsReviewer": "user",
+                  "sandboxPolicy": {
+                      "type": "workspaceWrite",
+                      "writableRoots": [cwd] if cwd else [],
+                      "networkAccess": False,
+                      "excludeTmpdirEnvVar": False,
+                  },
+              }
+
+          async def _send_jsonrpc(websocket, request_id, method, params=None, timeout=60):
+              payload = {"id": request_id, "method": method}
+              if params is not None:
+                  payload["params"] = params
+              await websocket.send(json.dumps(payload, ensure_ascii=False))
+              while True:
+                  raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+                  message = json.loads(raw)
+                  if isinstance(message.get("method"), str) and "id" in message:
+                      await _handle_server_request(websocket, message)
+                      continue
+                  if message.get("id") != request_id:
+                      continue
+                  if "error" in message:
+                      raise RuntimeError(f"{method} failed: {message['error']}")
+                  result = message.get("result")
+                  if not isinstance(result, dict):
+                      raise RuntimeError(f"{method} returned an invalid response.")
+                  return result
+
+          async def _handle_server_request(websocket, message):
+              request_id = message.get("id")
+              method = message.get("method")
+              if method == "item/permissions/requestApproval":
+                  await websocket.send(json.dumps({
+                      "id": request_id,
+                      "result": {"permissions": {}, "scope": "turn"},
+                  }))
+                  return
+              if method in {
+                  "item/commandExecution/requestApproval",
+                  "item/fileChange/requestApproval",
+              }:
+                  await websocket.send(json.dumps({
+                      "id": request_id,
+                      "result": {"decision": "accept"},
+                  }))
+                  return
+              await websocket.send(json.dumps({
+                  "id": request_id,
+                  "result": {},
+              }))
+
+          async def _wait_turn_completed(websocket, timeout=1800):
+              def _error_detail(value):
+                  if isinstance(value, dict):
+                      for key in ("message", "detail", "error"):
+                          detail = value.get(key)
+                          if isinstance(detail, str) and detail.strip():
+                              return detail.strip()
+                          if detail is not None:
+                              return json.dumps(detail, ensure_ascii=False)
+                      return json.dumps(value, ensure_ascii=False)
+                  if value is not None:
+                      return str(value)
+                  return "Codex app-server returned an error."
+
+              while True:
+                  raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+                  message = json.loads(raw)
+                  method = message.get("method")
+                  params = message.get("params")
+                  if isinstance(method, str) and "id" in message:
+                      await _handle_server_request(websocket, message)
+                      continue
+                  if method == "item/agentMessage/delta" and isinstance(params, dict):
+                      delta = params.get("delta")
+                      if isinstance(delta, str) and delta:
+                          print(delta, end="", flush=True)
+                      continue
+                  if method == "error" and isinstance(params, dict):
+                      raise RuntimeError(_error_detail(params))
+                  if method != "turn/completed" or not isinstance(params, dict):
+                      continue
+                  turn = params.get("turn")
+                  if not isinstance(turn, dict):
+                      raise RuntimeError("turn/completed returned an invalid payload.")
+                  status = str(turn.get("status") or "completed").lower()
+                  if status in {"failed", "cancelled", "canceled"}:
+                      raise RuntimeError(f"Codex review turn failed: {_error_detail(turn.get('error') or turn)}")
+                  return turn
+
+          async def _start_codex_review(endpoint, prompt):
+              app_server_url = _sandbox_service_url(endpoint, "/v1/codex/app-server/", websocket=True)
+              async with websockets.connect(
+                  app_server_url,
+                  open_timeout=30,
+                  close_timeout=5,
+                  ping_timeout=60,
+                  max_size=20 * 1024 * 1024,
+              ) as websocket:
+                  await _send_jsonrpc(
+                      websocket,
+                      1,
+                      "initialize",
+                      {
+                          "clientInfo": {
+                              "name": "github_actions_pr_review",
+                              "title": "GitHub Actions PR Review",
+                              "version": "1",
+                          },
+                          "capabilities": {"experimentalApi": True},
+                      },
+                  )
+                  await websocket.send(json.dumps({"method": "initialized"}))
+                  thread = await _send_jsonrpc(
+                      websocket,
+                      2,
+                      "thread/start",
+                      _runtime_permission_params(),
+                  )
+                  thread_id = thread.get("thread", {}).get("id") or thread.get("threadId")
+                  if not isinstance(thread_id, str) or not thread_id:
+                      raise RuntimeError("thread/start did not return a Thread ID.")
+                  cwd = thread.get("cwd")
+                  if not isinstance(cwd, str):
+                      cwd = ""
+                  turn_start = await _send_jsonrpc(
+                      websocket,
+                      3,
+                      "turn/start",
+                      {
+                          "threadId": thread_id,
+                          "input": [{"type": "text", "text": prompt}],
+                          **_runtime_permission_params(cwd),
+                      },
+                  )
+                  turn_id = turn_start.get("turn", {}).get("id")
+                  print(f"Submitted PR review message to Codex thread {thread_id}, turn {turn_id}")
+                  await _wait_turn_completed(websocket)
+                  print("Codex PR review completed.")
+
+          client = AgentkitToolsClient(
+              access_key=access_key,
+              secret_key=secret_key,
+              region=region,
+          )
+
+          configured_tool_id = os.environ.get("AGENTKIT_SANDBOX_TOOL_ID", "").strip()
+          if configured_tool_id:
+              tool_id = configured_tool_id
+          else:
+              response = client.list_tools(
+                  tools_types.ListToolsRequest(
+                      Filters=[
+                          tools_types.FiltersItemForListTools(
+                              Name="ToolType",
+                              Values=["CodeEnv"],
+                          )
+                      ]
+                  )
+              )
+              tools = list(getattr(response, "tools", None) or getattr(response, "Tools", None) or [])
+              ready_tools = [
+                  tool
+                  for tool in tools
+                  if (getattr(tool, "status", None) or getattr(tool, "Status", None) or "") == "Ready"
+              ]
+              if not ready_tools:
+                  raise RuntimeError("No Ready CodeEnv Sandbox Tool found. Configure the Codex Sandbox tool before enabling PR review.")
+              tool_id = getattr(ready_tools[0], "tool_id", None) or getattr(ready_tools[0], "ToolId", None)
+              if not tool_id:
+                  raise RuntimeError("Ready CodeEnv Sandbox Tool is missing ToolId.")
+
+          env_item = getattr(tools_types, "EnvsItemForCreateSession", None)
+          if env_item is None:
+              env_item = _SessionEnv
+
+          request_type = tools_types.CreateSessionRequest
+          if not _model_supports_alias(request_type, "Envs"):
+              request_type = _CreateSessionRequestCompat
+
+          request = request_type(
+              ToolId=tool_id,
+              UserSessionId=user_session_id,
+              Ttl=28800,
+              TtlUnit="second",
+              Envs=[env_item(Key="GH_TOKEN", Value=github_token)],
+          )
+          session = client.create_session(request)
+          instance_id = getattr(session, "session_id", None) or getattr(session, "SessionId", None)
+          endpoint = getattr(session, "endpoint", None) or getattr(session, "Endpoint", None)
+          if not instance_id or not endpoint:
+              raise RuntimeError("CreateSession response is missing SessionId or Endpoint.")
+
+          print(f"Created Sandbox Session {user_session_id}")
+          asyncio.run(_start_codex_review(endpoint, prompt))
+          PY
